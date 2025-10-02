@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: net-audit
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: route-audit-script
+  namespace: net-audit
+data:
+  audit.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    log() { echo -e "\n==== [$(
+      date -Iseconds
+    )] $* ====\n"; }
+
+    NODE_HOSTNAME="$(nsenter -t 1 -m -u -i -n -p sh -c 'cat /etc/hostname' 2>/dev/null || echo unknown)"
+    TS="$(date -Iseconds)"
+    OUT_DIR="/host-varlog/aks-route-audit"
+    OUT_FILE="${OUT_DIR}/${NODE_HOSTNAME}-${TS}.log"
+    mkdir -p "${OUT_DIR}"
+
+    exec > >(tee -a "${OUT_FILE}") 2>&1
+
+    log "Node basics"
+    nsenter -t 1 -m -u -i -n -p uname -a || true
+    nsenter -t 1 -m -u -i -n -p sh -c 'echo "Hostname: $(cat /etc/hostname)"; ip -br addr' || true
+
+    log "Routing tables (IPv4)"
+    nsenter -t 1 -m -u -i -n -p ip -4 route show table main || true
+    nsenter -t 1 -m -u -i -n -p ip -4 route show table local || true
+
+    log "Policy routing rules"
+    nsenter -t 1 -m -u -i -n -p ip rule show || true
+
+    log "Interfaces (detailed)"
+    nsenter -t 1 -m -u -i -n -p ip -d link show || true
+
+    log "Key interfaces (cni0, flannel/cali/azv/geneve/vxlan if present)"
+    nsenter -t 1 -m -u -i -n -p sh -c 'ip -o -4 addr show cni0 2>/dev/null || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'ip -o -4 addr | egrep -i "cali|flannel|azv|geneve|vxlan" || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'ip -4 route | egrep -i "cali|flannel|azv|geneve|vxlan" || true'
+
+    log "Default route + quick probe to 8.8.8.8"
+    nsenter -t 1 -m -u -i -n -p sh -c 'ip route | awk "/^default/{print}"; ip -4 route get 8.8.8.8 || true'
+
+    log "Per-pod /32 routes (if any CNI installs them)"
+    nsenter -t 1 -m -u -i -n -p sh -c 'ip -4 route | awk "$1 ~ /\\/32/ {print}" || true'
+
+    log "iptables (Calico chains, if Calico NP is enabled)"
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t raw -S   2>/dev/null | grep -i cali || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t mangle -S 2>/dev/null | grep -i cali || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t filter -S 2>/dev/null | grep -i cali || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t nat -S    2>/dev/null | grep -i cali || true'
+
+    log "iptables (Istio chains, node-level)"
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t raw -S   2>/dev/null | grep -i ISTIO || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t mangle -S 2>/dev/null | grep -i ISTIO || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t filter -S 2>/dev/null | grep -i ISTIO || true'
+    nsenter -t 1 -m -u -i -n -p sh -c 'iptables -t nat -S    2>/dev/null | grep -i ISTIO || true'
+
+    log "Azure hint (kubenet): local pod CIDR on cni0 if kubenet"
+    nsenter -t 1 -m -u -i -n -p sh -c 'ip -o -4 addr show cni0 2>/dev/null | awk "{print \\$4}" || true'
+
+    # Optional: inspect Istio-injected podsΓÇÖ NAT rules inside their netns
+    # Requires containerd socket and crictl available in the container.
+    if command -v crictl >/dev/null 2>&1; then
+      log "Attempting Istio per-pod iptables (requires containerd + crictl)"
+      RUNTIME_EP="unix:///host-run/containerd/containerd.sock"
+      # Find up to 5 istio-proxy containers (common name)
+      crictl --runtime-endpoint="${RUNTIME_EP}" ps --name istio-proxy -q 2>/dev/null | head -n 5 | while read -r CID; do
+        [ -z "${CID}" ] && continue
+        PID="$(crictl --runtime-endpoint="${RUNTIME_EP}" inspect "${CID}" 2>/dev/null | jq -r '.info.pid // empty')"
+        if [ -n "${PID}" ] && [ "${PID}" != "null" ]; then
+          echo "--- ISTIO POD CONTAINER ${CID} (pid ${PID}) ---"
+          nsenter -t "${PID}" -n iptables -t nat -S 2>/dev/null | grep ISTIO || echo "No ISTIO nat rules found"
+          nsenter -t "${PID}" -n iptables -t mangle -S 2>/dev/null | grep ISTIO || true
+        fi
+      done
+    else
+      log "crictl not available in container ΓÇö skipping per-pod ISTIO rules"
+    fi
+
+    log "Done. Output saved to ${OUT_FILE}"
+    # Keep pod alive just long enough to ensure logs ship
+    sleep 2
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: route-audit
+  namespace: net-audit
+spec:
+  selector:
+    matchLabels:
+      app: route-audit
+  template:
+    metadata:
+      labels:
+        app: route-audit
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: "Exists"
+      volumes:
+        # Write logs onto the host so you can collect later
+        - name: host-varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+        # Access to containerd socket for optional crictl per-pod checks
+        - name: host-run-containerd
+          hostPath:
+            path: /run/containerd
+            type: DirectoryOrCreate
+        # Script from ConfigMap
+        - name: script
+          configMap:
+            name: route-audit-script
+            defaultMode: 0755
+      containers:
+        - name: auditor
+          image: debian:stable-slim
+          securityContext:
+            privileged: true   # needed for nsenter across host namespaces
+          command: ["/bin/bash","-lc"]
+          args:
+            - |
+              set -e
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 iptables util-linux jq ca-certificates curl cri-tools
+              /scripts/audit.sh
+          volumeMounts:
+            - name: host-varlog
+              mountPath: /host-varlog
+            - name: host-run-containerd
+              mountPath: /host-run/containerd
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      nodeSelector: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: route-audit
+  namespace: net-audit
+
