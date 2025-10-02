@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dig-job
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: dig
+        # Includes: dig, nslookup, curl, wget, jq, busybox tools
+        image: registry.k8s.io/e2e-test-images/dnsutils:1.3
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: TARGET_HOST
+          value: ""  # <-- your target
+        - name: CUSTOMER_DNS
+          value: "1.9.1.5 1.6.4.5 1.2.2.7"                  # edit values with your dns servers  space-separated
+        command: ["/bin/sh","-c"]
+        args:
+        - |
+          set -eux
+
+          echo "=== /etc/resolv.conf ==="
+          cat /etc/resolv.conf || true
+
+          echo "=== Collect resolvers from resolv.conf ==="
+          RESOLVERS="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf || true)"
+          echo "RESOLVERS=${RESOLVERS}"
+
+          echo "=== Resolve kube-dns Service IP (cluster DNS) ==="
+          # Use the Service DNS name instead of scraping CoreDNS pod IPs
+          KUBE_DNS_NAME="kube-dns.kube-system.svc.cluster.local"
+          KUBE_DNS_IP="$(getent hosts "${KUBE_DNS_NAME}" | awk '{print $1}' | head -n1 || true)"
+          echo "KUBE_DNS_NAME=${KUBE_DNS_NAME}"
+          echo "KUBE_DNS_IP=${KUBE_DNS_IP:-<not found>}"
+
+          echo "=== Dig using resolv.conf nameservers ==="
+          for S in ${RESOLVERS}; do
+            echo "--- dig @${S} ${TARGET_HOST} (UDP) ---"
+            dig +time=3 +tries=1 @"${S}" "${TARGET_HOST}" || true
+            echo "--- dig @${S} ${TARGET_HOST} (TCP) ---"
+            dig +tcp +time=3 +tries=1 @"${S}" "${TARGET_HOST}" || true
+          done
+
+          echo "=== Dig using kube-dns Service ==="
+          if [ -n "${KUBE_DNS_IP:-}" ]; then
+            echo "--- dig @${KUBE_DNS_IP} ${TARGET_HOST} (UDP) ---"
+            dig +time=3 +tries=1 @"${KUBE_DNS_IP}" "${TARGET_HOST}" || true
+            echo "--- dig @${KUBE_DNS_IP} ${TARGET_HOST} (TCP) ---"
+            dig +tcp +time=3 +tries=1 @"${KUBE_DNS_IP}" "${TARGET_HOST}" || true
+          else
+            echo "kube-dns Service IP not resolved; skipping."
+          fi
+
+          echo "=== Dig using on-prem/customer DNS servers ==="
+          for S in ${CUSTOMER_DNS}; do
+            echo "--- dig @${S} ${TARGET_HOST} (UDP) ---"
+            dig +time=3 +tries=1 @"${S}" "${TARGET_HOST}" || true
+            echo "--- dig @${S} ${TARGET_HOST} (TCP) ---"
+            dig +tcp +time=3 +tries=1 @"${S}" "${TARGET_HOST}" || true
+          done
+
+          echo "=== nslookup (default resolvers) ==="
+          nslookup "${TARGET_HOST}" || true
+
+          echo "=== curl HTTPS HEAD (sanity check) ==="
+          # -k to ignore cert issues if you just want connectivity
+          curl -vIk --max-time 5 "https://${TARGET_HOST}:443/" || true
+
+          echo "=== Done ==="
