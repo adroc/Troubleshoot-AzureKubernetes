@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dig-ds-pg
+  namespace: kube-system
+  labels:
+    app: dig-ds
+spec:
+  selector:
+    matchLabels:
+      app: dig-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: dig-ds
+    spec:
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "CriticalAddonsOnly"
+          operator: "Exists"
+        - operator: "Exists"
+      hostNetwork: true
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      containers:
+      - name: dig
+        image: nicolaka/netshoot:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+          if [ -z "${CORE_DNS_IP:-}" ]; then
+            echo "[$(ts)] ERROR: CORE_DNS_IP env var is not set. Exiting."
+            exit 1
+          fi
+
+          # Collect resolvers from pod's /etc/resolv.conf
+          RESOLVERS=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf)
+
+          # On-prem resolvers (edit as needed)
+          CUSTOMER_DNS_SERVERS=("10.92.71.25" "10.166.64.25" "10.172.25.170")
+
+          while true; do
+            echo "[$(ts)] ===== Node: ${NODE_NAME:-unknown} Pod: ${HOSTNAME_POD:-unknown} ====="
+
+            echo "[$(ts)] === /etc/resolv.conf ==="
+            cat /etc/resolv.conf || true
+
+            echo "[$(ts)] === Dig via node resolvers ==="
+            for DNS_SERVER in $RESOLVERS; do
+              echo "[$(ts)] -> resolver: $DNS_SERVER"
+              dig +time=2 +tries=1 @"$DNS_SERVER" "$TARGET_HOST" || echo "[$(ts)] dig failed via $DNS_SERVER"
+            done
+
+            echo "[$(ts)] === Dig via CoreDNS service IP (${CORE_DNS_IP}) ==="
+            dig +time=2 +tries=1 @"${CORE_DNS_IP}" "$TARGET_HOST" || echo "[$(ts)] dig failed via ${CORE_DNS_IP}"
+
+            echo "[$(ts)] === Dig via On-Prem DNS servers ==="
+            for CUSTOMER_DNS in "${CUSTOMER_DNS_SERVERS[@]}"; do
+              echo "[$(ts)] -> on-prem resolver: $CUSTOMER_DNS"
+              dig +time=2 +tries=1 @"$CUSTOMER_DNS" "$TARGET_HOST" || echo "[$(ts)] dig failed via $CUSTOMER_DNS"
+            done
+
+            echo "[$(ts)] === Nslookup (cluster default path) ==="
+            nslookup "$TARGET_HOST" || echo "[$(ts)] nslookup failed"
+
+            echo "[$(ts)] === Curl HTTPS HEAD (port 443) ==="
+            curl -vvLkI --connect-timeout 5 --max-time 10 "https://${TARGET_HOST}:443" || echo "[$(ts)] curl failed"
+
+            echo "[$(ts)] ===== sleeping 10s ====="
+            sleep 10
+          done
+        env:
+          - name: TARGET_HOST
+            value: ".hcp.northeurope.azmk8s.io"  # set your target
+          - name: CORE_DNS_IP
+            value: "10.0.0.10"   # <-- set this to your CoreDNS Service ClusterIP
+          - name: HOSTNAME_POD
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        resources:
+          requests:
+            cpu: 20m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
